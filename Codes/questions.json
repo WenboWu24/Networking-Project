@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "quizzes": [
+    {
+      "quiz_id": "network-basics",
+      "title": "Networking Fundamentals",
+      "description": "Five introductory questions about core networking concepts.",
+      "questions": [
+        {
+          "question_id": "NET001",
+          "text": "Which transport protocol provides reliable byte-stream delivery?",
+          "options": {"A": "UDP", "B": "TCP", "C": "ARP", "D": "ICMP"},
+          "answer": "B",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "NET002",
+          "text": "Which device forwards packets between IP networks?",
+          "options": {"A": "Router", "B": "Hub", "C": "Repeater", "D": "Patch panel"},
+          "answer": "A",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "NET003",
+          "text": "Which protocol maps a domain name to an IP address?",
+          "options": {"A": "DHCP", "B": "HTTP", "C": "DNS", "D": "FTP"},
+          "answer": "C",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "NET004",
+          "text": "How many bits are in an IPv4 address?",
+          "options": {"A": "16", "B": "32", "C": "64", "D": "128"},
+          "answer": "B",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "NET005",
+          "text": "Which layer provides end-to-end process communication?",
+          "options": {"A": "Physical", "B": "Data link", "C": "Network", "D": "Transport"},
+          "answer": "D",
+          "time_limit": 15,
+          "points": 100
+        }
+      ]
+    },
+    {
+      "quiz_id": "transport-layer",
+      "title": "Transport and Application Layer",
+      "description": "Five questions on ports, reliability and common application protocols.",
+      "questions": [
+        {
+          "question_id": "TRN001",
+          "text": "Which transport protocol is connectionless?",
+          "options": {"A": "TCP", "B": "UDP", "C": "SCTP", "D": "TLS"},
+          "answer": "B",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "TRN002",
+          "text": "What is the default port number for HTTPS?",
+          "options": {"A": "80", "B": "443", "C": "22", "D": "25"},
+          "answer": "B",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "TRN003",
+          "text": "Which TCP mechanism prevents a sender from overwhelming a receiver?",
+          "options": {"A": "Fragmentation", "B": "Flow control", "C": "Routing", "D": "Addressing"},
+          "answer": "B",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "TRN004",
+          "text": "Which three-way handshake step comes immediately after SYN?",
+          "options": {"A": "ACK", "B": "SYN-ACK", "C": "FIN", "D": "RST"},
+          "answer": "B",
+          "time_limit": 15,
+          "points": 100
+        },
+        {
+          "question_id": "TRN005",
+          "text": "Which application protocol is used to send and receive email from a server?",
+          "options": {"A": "SMTP", "B": "SNMP", "C": "SSH", "D": "NTP"},
+          "answer": "A",
+          "time_limit": 15,
+          "points": 100
+        }
+      ]
+    }
+  ]
+}
