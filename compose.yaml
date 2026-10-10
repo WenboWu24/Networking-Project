@@ -1,0 +1,9 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: networking_app_py312
+    volumes:
+      - ./Codes:/app
+    working_dir: /app
