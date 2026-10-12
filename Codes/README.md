@@ -28,6 +28,54 @@ Pressing Ctrl+C stops the server cleanly: it stops room timers, closes the
 listening socket and every open connection, then exits with status 0.  `SIGTERM`
 is handled the same way, which makes scripted shutdowns reliable.
 
+## Repository Docker environment
+
+The course Docker setup confirmed for this project is defined by the repository
+root `compose.yaml` and `dockerfile`. It builds a Python 3.12 slim image and
+mounts `Codes` at `/app`. No packages are installed by the application.
+
+Run these commands from the repository root:
+
+```bash
+docker compose build app
+docker compose up -d app
+```
+
+Open separate terminals at the repository root; all processes below run in the
+same container, so clients connect to the server through container loopback:
+
+```bash
+# Terminal 1 - server
+docker compose exec app python3 server.py --host 0.0.0.0 --port 9000 --questions questions.json
+
+# Terminal 2 - first client
+docker compose exec app python3 client.py --server 127.0.0.1 --port 9000 --id alice --name Alice
+
+# Terminal 3 - second client
+docker compose exec app python3 client.py --server 127.0.0.1 --port 9000 --id bob --name Bob
+```
+
+Stop clients with `quit`, stop the server with Ctrl+C, then run
+`docker compose down` to stop the development container. The container's default
+command only keeps it running; launch the server and clients explicitly.
+
+Run the automated checks without leaving a test container behind:
+
+```bash
+docker compose run --rm --no-deps -T app python3 -m unittest discover -s tests -v
+```
+
+Verification on 2026-10-12 used the repository Compose environment with Python
+3.12.15: all 35 tests passed without skips, including Ctrl+C and ten clients in
+two independent rooms. Two actual `client.py` processes also completed login,
+room creation/joining, readiness, five questions, scoring, the leaderboard and
+normal exit against the actual `server.py`; both received 500 points.
+The `python:3.12-slim` tag can receive patch updates; check the actual Python
+version when recording a new test run.
+
+Keep the Docker setup in the development repository. Exclude Dockerfiles and
+Docker images from the final coursework ZIP, as required by the task sheet.
+
 ## Repository layout
 
 | File | Responsibility |
@@ -38,6 +86,7 @@ is handled the same way, which makes scripted shutdowns reliable.
 | `questionbank.py` | Loading and validation of the compulsory question-bank schema |
 | `questions.json` | Development question bank (2 quizzes, 5 questions each) |
 | `tests/test_smoke.py` | Repeatable smoke tests (validation, start-up, end-to-end play) |
+| `tests/test_server_regressions.py` | Deadline, concurrency, identity, validation and cleanup regressions |
 
 ## CLI command summary
 
@@ -134,6 +183,5 @@ malformed-frame handling and Ctrl+C shutdown.
 `tests/test_server_regressions.py` additionally covers authoritative deadlines,
 closed questions, duplicate answers, concurrent room joins/start, unique names,
 question-bank boundary cases and failed-send cleanup.
-On Windows the POSIX SIGINT subprocess test is skipped; it runs in the
-examiner's Linux Docker image. Local Windows results are development checks,
-not a replacement for the required official-image verification.
+On Windows the POSIX SIGINT subprocess test is skipped. In the repository's
+Linux Docker environment it runs and passed in the verification above.
