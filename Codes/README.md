@@ -67,6 +67,8 @@ length header.  Receivers must cope with TCP fragmentation and coalescing; the
 `MessageReader` class does this with an internal buffer.
 
 Envelope: `{"v": 1, "kind": ..., "type": ..., "id": ..., "data": {...}}`
+The version must be the integer `1`; request identifiers must be integers or
+`null`, and JSON booleans are not accepted as integers.
 
 * `kind = request` - client to server, `id` is a client request identifier.
 * `kind = response` - server to client, `id` echoes the request.
@@ -87,6 +89,9 @@ Request types: `login`, `list_quizzes`, `create_room`, `list_rooms`,
 * The server controls question order (file order) and timing.  Each question is
   open for its own `time_limit` seconds, and closes early once every active
   player has answered.
+  The deadline begins when the server opens the question and is checked again
+  for each answer; answers at or after the deadline are rejected. No answers
+  are accepted during the intermission after a question closes.
 * At most one answer per active player per question.  A correct accepted answer
   scores the question's `points`; incorrect, duplicate, missing or late answers
   score zero.  There is no time bonus.
@@ -99,8 +104,14 @@ Request types: `login`, `list_quizzes`, `create_room`, `list_rooms`,
 
 * Framing is a 4-byte length prefix with JSON payloads, and the maximum message
   size is 1 MB.
+* Idle connections remain open. A write blocked for 0.5 seconds closes that
+  connection so a slow reader cannot block a room indefinitely. Shutdown
+  closes both logged-in and not-yet-logged-in connections.
 * Duplicate active user ids are rejected deterministically: the newcomer is
   refused with `duplicate_id`.  Ids become free again when the client disconnects.
+* Active display names are also unique (case-sensitive). A newcomer with an
+  already active display name is refused with `bad_request`. Ids and names
+  must be printable and non-blank.
 * A user may be in at most one room at a time.  Leaving a room during play
   removes the player and their score from that room.
 * If the host leaves, the host role is handed to the remaining member with the
@@ -120,3 +131,9 @@ python3 -m unittest discover -s tests -v
 The tests cover question-bank validation, the `SERVER_READY` contract, invalid
 start-up exit codes, an end-to-end two-player quiz, duplicate-id rejection,
 malformed-frame handling and Ctrl+C shutdown.
+`tests/test_server_regressions.py` additionally covers authoritative deadlines,
+closed questions, duplicate answers, concurrent room joins/start, unique names,
+question-bank boundary cases and failed-send cleanup.
+On Windows the POSIX SIGINT subprocess test is skipped; it runs in the
+examiner's Linux Docker image. Local Windows results are development checks,
+not a replacement for the required official-image verification.

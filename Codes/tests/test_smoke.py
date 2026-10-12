@@ -364,6 +364,7 @@ class ServerStartupTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertNotIn("SERVER_READY", out)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX SIGINT subprocess test requires Linux")
     def test_ctrl_c_shuts_down_cleanly(self):
         port = free_port()
         server = start_server(SHIPPED_BANK, port)

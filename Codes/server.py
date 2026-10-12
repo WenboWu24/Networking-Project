@@ -64,6 +64,9 @@ MAX_PARTICIPANTS = 20
 #: Maximum accepted display-name length.
 MAX_NAME_LENGTH = 40
 
+# Bound socket operations so an idle or slow client cannot block shutdown.
+SOCKET_TIMEOUT = 0.5
+
 
 class ClientSession:
     """One connected client: socket, identity and room membership."""
@@ -75,7 +78,7 @@ class ClientSession:
         self.user_id: Optional[str] = None
         self.display_name: Optional[str] = None
         self.room_id: Optional[str] = None
-        self._send_lock = threading.Lock()
+        self._send_lock = threading.RLock()
         self._closed = False
 
     # -- outbound ------------------------------------------------------
@@ -83,6 +86,7 @@ class ClientSession:
         try:
             frame = proto.encode_message(kind, type_, data, id)
         except ProtocolError:
+            self.close()
             return
         with self._send_lock:
             if self._closed:
@@ -90,7 +94,7 @@ class ClientSession:
             try:
                 self.conn.sendall(frame)
             except OSError:
-                self._closed = True
+                self.close()
 
     def send_response(self, id: Optional[int], type_: str, data: Optional[Dict[str, Any]] = None) -> None:
         LOG.debug("-> response %s id=%s", type_, id)
@@ -133,6 +137,7 @@ class Room:
         self.correct: Dict[str, int] = {}
         self.answers: Dict[str, Dict[str, str]] = {}
         self.current_question: Optional[Question] = None
+        self.question_deadline: Optional[float] = None
         self.current_index = -1
         self.current_players: List[str] = []
         self.cond = threading.Condition(threading.RLock())
@@ -151,6 +156,10 @@ class Room:
         with self.cond:
             self.members.pop(user_id, None)
             self.ready.discard(user_id)
+            self.scores.pop(user_id, None)
+            self.correct.pop(user_id, None)
+            for answers in self.answers.values():
+                answers.pop(user_id, None)
             if self.host_id == user_id and self.members:
                 # Deterministic host handover: lowest user_id still present.
                 self.host_id = sorted(self.members)[0]
@@ -231,9 +240,14 @@ class Room:
     def submit_answer(self, user_id: str, question_id: str, choice: str):
         """Return ``(status, detail)``; status is ``accepted`` or an error code."""
         with self.cond:
-            if self.state != ROOM_PLAYING or self.current_question is None:
+            if self.state != ROOM_PLAYING or self.stop_event.is_set():
                 return proto.ERR_NOT_PLAYING, "no question is open"
-            if self.current_question.question_id != question_id:
+            if user_id not in self.members or user_id not in self.current_players:
+                return proto.ERR_NOT_IN_ROOM, "you are not an active player for this question"
+            if (self.current_question is None
+                    or self.current_question.question_id != question_id
+                    or self.question_deadline is None
+                    or time.monotonic() >= self.question_deadline):
                 return proto.ERR_LATE_ANSWER, "that question is not open"
             if choice not in self.current_question.options:
                 return proto.ERR_INVALID_CHOICE, "choice must be one of A, B, C or D"
@@ -254,6 +268,8 @@ class Room:
 
     def _close_question(self, question: Question) -> Dict[str, Any]:
         with self.cond:
+            self.current_question = None
+            self.question_deadline = None
             answers = dict(self.answers.get(question.question_id, {}))
             results = []
             for user_id, choice in sorted(answers.items()):
@@ -297,6 +313,8 @@ class Room:
                 return
             with self.cond:
                 self.current_question = question
+                self.question_deadline = time.monotonic() + question.time_limit
+                deadline = self.question_deadline
                 self.current_index = index
                 self.current_players = list(self.members.keys())
                 self.answers[question.question_id] = {}
@@ -304,7 +322,6 @@ class Room:
             payload["room_id"] = self.room_id
             self.broadcast_event(proto.EV_QUESTION_STARTED, payload)
 
-            deadline = time.monotonic() + question.time_limit
             with self.cond:
                 while not self.stop_event.is_set():
                     if self._all_players_answered(question.question_id):
@@ -316,6 +333,11 @@ class Room:
                     # as soon as every active player has answered.
                     self.cond.wait(min(remaining, 0.2))
 
+                if self.stop_event.is_set():
+                    self.current_question = None
+                    self.question_deadline = None
+                    return
+
             closed = self._close_question(question)
             closed["room_id"] = self.room_id
             self.broadcast_event(proto.EV_QUESTION_CLOSED, closed)
@@ -326,6 +348,7 @@ class Room:
         with self.cond:
             self.state = ROOM_FINISHED
             self.current_question = None
+            self.question_deadline = None
         self.broadcast_event(
             proto.EV_QUIZ_FINISHED,
             {
@@ -340,6 +363,8 @@ class Room:
     def stop(self) -> None:
         self.stop_event.set()
         with self.cond:
+            self.current_question = None
+            self.question_deadline = None
             self.cond.notify_all()
         thread = self.game_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
@@ -357,6 +382,7 @@ class QuizServer:
         self._shutdown = threading.Event()
         self._state_lock = threading.RLock()
         self._sessions: Dict[str, ClientSession] = {}
+        self._connections: set[ClientSession] = set()
         self._rooms: Dict[str, Room] = {}
         self._connection_threads: List[threading.Thread] = []
         self._handlers: Dict[str, Callable[[ClientSession, Optional[int], Dict[str, Any]], bool]] = {
@@ -386,6 +412,7 @@ class QuizServer:
             listen_socket.close()
             raise
         self._listen_socket = listen_socket
+        listen_socket.settimeout(SOCKET_TIMEOUT)
 
         print("SERVER_READY", flush=True)
         LOG.info("listening on %s:%s", self.host, self.port)
@@ -394,11 +421,17 @@ class QuizServer:
             while not self._shutdown.is_set():
                 try:
                     conn, addr = listen_socket.accept()
+                except socket.timeout:
+                    continue
                 except OSError:
                     break
+                conn.settimeout(SOCKET_TIMEOUT)
+                session = ClientSession(conn, addr, self)
+                with self._state_lock:
+                    self._connections.add(session)
                 thread = threading.Thread(
                     target=self._handle_connection,
-                    args=(conn, addr),
+                    args=(session,),
                     name=f"client-{addr[0]}:{addr[1]}",
                     daemon=True,
                 )
@@ -421,11 +454,11 @@ class QuizServer:
                 pass
         with self._state_lock:
             rooms = list(self._rooms.values())
-            sessions = list(self._sessions.values())
-        for room in rooms:
-            room.stop()
+            sessions = list(self._connections)
         for session in sessions:
             session.close()
+        for room in rooms:
+            room.stop()
         for thread in self._connection_threads:
             if thread.is_alive():
                 thread.join(timeout=1.0)
@@ -434,14 +467,16 @@ class QuizServer:
     # ------------------------------------------------------------------
     # connection handling
     # ------------------------------------------------------------------
-    def _handle_connection(self, conn: socket.socket, addr) -> None:
-        session = ClientSession(conn, addr, self)
+    def _handle_connection(self, session: ClientSession) -> None:
+        conn, addr = session.conn, session.addr
         reader = MessageReader()
         LOG.info("connection from %s:%s", addr[0], addr[1])
         try:
             while not self._shutdown.is_set():
                 try:
                     chunk = conn.recv(4096)
+                except socket.timeout:
+                    continue
                 except OSError:
                     break
                 if not chunk:
@@ -471,13 +506,17 @@ class QuizServer:
         kind = message.get("kind")
         type_ = message.get("type")
 
+        if type(message.get("v")) is not int or message["v"] != proto.PROTOCOL_VERSION:
+            session.send_error(req_id if type(req_id) is int else None, proto.ERR_BAD_REQUEST, "unsupported protocol version")
+            return True
+
         if kind != proto.KIND_REQUEST:
             session.send_error(req_id if isinstance(req_id, int) else None, proto.ERR_BAD_REQUEST, "expected a request message")
             return True
         if not isinstance(type_, str):
             session.send_error(req_id if isinstance(req_id, int) else None, proto.ERR_BAD_REQUEST, "request type must be a string")
             return True
-        if req_id is not None and not isinstance(req_id, int):
+        if req_id is not None and type(req_id) is not int:
             session.send_error(None, proto.ERR_BAD_REQUEST, "request id must be an integer or null")
             return True
 
@@ -500,14 +539,16 @@ class QuizServer:
             return True
 
     def _cleanup_session(self, session: ClientSession) -> None:
+        session.close()
         user_id = session.user_id
         if user_id is not None:
-            with self._state_lock:
-                self._sessions.pop(user_id, None)
             room_id = session.room_id
             if room_id is not None:
                 self._leave_room(session)
-        session.close()
+        with self._state_lock:
+            if user_id is not None and self._sessions.get(user_id) is session:
+                self._sessions.pop(user_id)
+            self._connections.discard(session)
         LOG.info("connection from %s closed", session.addr[0])
 
     # ------------------------------------------------------------------
@@ -528,15 +569,16 @@ class QuizServer:
             return None
         with self._state_lock:
             room = self._rooms.get(room_id)
-        if room is None:
-            session.room_id = None
-            return None
-        session.room_id = None
-        empty = room.remove_member(session.user_id)
+            if room is None:
+                session.room_id = None
+                return None
+            with room.cond:
+                session.room_id = None
+                empty = room.remove_member(session.user_id)
+                if empty:
+                    self._rooms.pop(room_id, None)
         if empty:
             room.stop()
-            with self._state_lock:
-                self._rooms.pop(room_id, None)
             LOG.info("room %s removed (empty)", room_id)
         else:
             self._broadcast_room_state(room)
@@ -552,21 +594,27 @@ class QuizServer:
 
         user_id = data.get("user_id")
         display_name = data.get("display_name")
-        if not isinstance(user_id, str) or not (1 <= len(user_id) <= 32):
-            session.send_error(req_id, proto.ERR_BAD_REQUEST, "user_id must be 1-32 characters")
+        if not isinstance(user_id, str) or not (1 <= len(user_id) <= 32) or not user_id.isprintable() or not user_id.strip():
+            session.send_error(req_id, proto.ERR_BAD_REQUEST, "user_id must be 1-32 printable characters and not blank")
             return False
-        if not isinstance(display_name, str) or not (1 <= len(display_name) <= MAX_NAME_LENGTH):
-            session.send_error(req_id, proto.ERR_BAD_REQUEST, f"display_name must be 1-{MAX_NAME_LENGTH} characters")
+        if not isinstance(display_name, str) or not (1 <= len(display_name) <= MAX_NAME_LENGTH) or not display_name.isprintable() or not display_name.strip():
+            session.send_error(req_id, proto.ERR_BAD_REQUEST, f"display_name must be 1-{MAX_NAME_LENGTH} printable characters and not blank")
             return False
 
         with self._state_lock:
+            error = None
             if user_id in self._sessions:
                 # Deterministic duplicate handling: reject the newcomer.
-                session.send_error(req_id, proto.ERR_DUPLICATE_ID, f"user id {user_id!r} is already active")
-                return False
-            session.user_id = user_id
-            session.display_name = display_name
-            self._sessions[user_id] = session
+                error = (proto.ERR_DUPLICATE_ID, f"user id {user_id!r} is already active")
+            elif any(s.display_name == display_name for s in self._sessions.values()):
+                error = (proto.ERR_BAD_REQUEST, f"display name {display_name!r} is already active")
+            else:
+                session.user_id = user_id
+                session.display_name = display_name
+                self._sessions[user_id] = session
+        if error is not None:
+            session.send_error(req_id, *error)
+            return False
 
         LOG.info("login: %s (%s)", user_id, display_name)
         session.send_response(req_id, proto.REQ_LOGIN, {"user_id": user_id, "display_name": display_name})
@@ -601,10 +649,9 @@ class QuizServer:
             while room_id in self._rooms:
                 room_id = f"R-{uuid.uuid4().hex[:6]}"
             room = Room(room_id, quiz, host_id=session.user_id)
+            session.room_id = room_id
+            room.add_member(session)
             self._rooms[room_id] = room
-
-        session.room_id = room_id
-        room.add_member(session)
         LOG.info("room %s created by %s for quiz %s", room_id, session.user_id, quiz.quiz_id)
         session.send_response(req_id, proto.REQ_CREATE_ROOM, room.snapshot())
         self._broadcast_room_state(room)
@@ -617,9 +664,9 @@ class QuizServer:
             rooms = list(self._rooms.values())
         joinable = []
         for room in rooms:
-            if room.state != ROOM_LOBBY:
-                continue
             snapshot = room.snapshot()
+            if snapshot["state"] != ROOM_LOBBY or snapshot["participant_count"] >= MAX_PARTICIPANTS:
+                continue
             joinable.append(
                 {
                     "room_id": snapshot["room_id"],
@@ -643,18 +690,21 @@ class QuizServer:
         room_id = data.get("room_id")
         with self._state_lock:
             room = self._rooms.get(room_id) if isinstance(room_id, str) else None
-        if room is None:
-            session.send_error(req_id, proto.ERR_UNKNOWN_ROOM, f"unknown room_id {room_id!r}")
+            error = None
+            if room is None:
+                error = (proto.ERR_UNKNOWN_ROOM, f"unknown room_id {room_id!r}")
+            else:
+                with room.cond:
+                    if room.state != ROOM_LOBBY:
+                        error = (proto.ERR_ROOM_NOT_JOINABLE, "that room has already started")
+                    elif len(room.members) >= MAX_PARTICIPANTS:
+                        error = (proto.ERR_ROOM_FULL, "that room is full")
+                    else:
+                        session.room_id = room_id
+                        room.add_member(session)
+        if error is not None:
+            session.send_error(req_id, *error)
             return True
-        if room.state != ROOM_LOBBY:
-            session.send_error(req_id, proto.ERR_ROOM_NOT_JOINABLE, "that room has already started")
-            return True
-        if len(room.members) >= MAX_PARTICIPANTS:
-            session.send_error(req_id, proto.ERR_ROOM_FULL, "that room is full")
-            return True
-
-        session.room_id = room_id
-        room.add_member(session)
         LOG.info("%s joined room %s", session.user_id, room_id)
         session.send_response(req_id, proto.REQ_JOIN_ROOM, room.snapshot())
         self._broadcast_room_state(room)
@@ -699,10 +749,13 @@ class QuizServer:
         if room is None:
             session.send_error(req_id, proto.ERR_UNKNOWN_ROOM, "your room no longer exists")
             return True
-        if room.state != ROOM_LOBBY:
+        with room.cond:
+            in_lobby = room.state == ROOM_LOBBY
+            if in_lobby:
+                room.set_ready(session.user_id, ready)
+        if not in_lobby:
             session.send_error(req_id, proto.ERR_QUIZ_IN_PROGRESS, "readiness can only change in the lobby")
             return True
-        room.set_ready(session.user_id, ready)
         session.send_response(req_id, proto.REQ_SET_READY, {"ready": ready})
         self._broadcast_room_state(room)
         return True
@@ -718,18 +771,18 @@ class QuizServer:
         if room is None:
             session.send_error(req_id, proto.ERR_UNKNOWN_ROOM, "your room no longer exists")
             return True
-        if room.state != ROOM_LOBBY:
-            session.send_error(req_id, proto.ERR_QUIZ_IN_PROGRESS, "the quiz has already started")
-            return True
-        if session.user_id != room.host_id:
-            session.send_error(req_id, proto.ERR_NOT_HOST, "only the room host can start the quiz")
-            return True
-        if not room.all_ready():
-            session.send_error(req_id, proto.ERR_NOT_READY, "every participant must be ready before starting")
-            return True
-
-        session.send_response(req_id, proto.REQ_START_QUIZ, {"room_id": room.room_id, "state": ROOM_PLAYING})
-        room.start()
+        with room.cond:
+            if room.state != ROOM_LOBBY:
+                error = (proto.ERR_QUIZ_IN_PROGRESS, "the quiz has already started")
+            elif session.user_id != room.host_id:
+                error = (proto.ERR_NOT_HOST, "only the room host can start the quiz")
+            elif not room.all_ready():
+                error = (proto.ERR_NOT_READY, "every participant must be ready before starting")
+            else:
+                session.send_response(req_id, proto.REQ_START_QUIZ, {"room_id": room.room_id, "state": ROOM_PLAYING})
+                room.start()
+                return True
+        session.send_error(req_id, *error)
         return True
 
     def _req_answer(self, session: ClientSession, req_id: Optional[int], data: Dict[str, Any]) -> bool:

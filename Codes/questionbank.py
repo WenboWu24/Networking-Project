@@ -96,7 +96,7 @@ def _parse_question(raw: Any, quiz_id: str, index: int, seen_question_ids: set) 
 
     question_id = raw.get("question_id")
     _require(
-        isinstance(question_id, str) and bool(_ID_RE.match(question_id)),
+        isinstance(question_id, str) and bool(_ID_RE.fullmatch(question_id)),
         f"{where}.question_id must be 1-32 characters from [A-Za-z0-9_-]",
     )
     _require(question_id not in seen_question_ids, f"duplicate question_id {question_id!r} (must be unique in the file)")
@@ -112,8 +112,8 @@ def _parse_question(raw: Any, quiz_id: str, index: int, seen_question_ids: set) 
     )
     for key in _OPTION_KEYS:
         _require(
-            _visible(options[key], 1, 200),
-            f"{where}.options[{key}] must be 1-200 visible characters",
+            isinstance(options[key], str) and 1 <= len(options[key]) <= 200,
+            f"{where}.options[{key}] must be 1-200 characters",
         )
 
     answer = raw.get("answer")
@@ -141,7 +141,7 @@ def _parse_quiz(raw: Any, index: int, seen_quiz_ids: set, seen_question_ids: set
 
     quiz_id = raw.get("quiz_id")
     _require(
-        isinstance(quiz_id, str) and bool(_ID_RE.match(quiz_id)),
+        isinstance(quiz_id, str) and bool(_ID_RE.fullmatch(quiz_id)),
         f"{where}.quiz_id must be 1-32 characters from [A-Za-z0-9_-]",
     )
     _require(quiz_id not in seen_quiz_ids, f"duplicate quiz_id {quiz_id!r} (must be unique)")
@@ -186,6 +186,10 @@ def validate_question_bank(raw: Any, source_path: str = "<memory>") -> QuestionB
     return QuestionBank(schema_version=schema_version, quizzes=parsed_quizzes, source_path=source_path)
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant {value}")
+
+
 def load_question_bank(path: str) -> QuestionBank:
     """Read *path* from disk and validate it.
 
@@ -210,8 +214,8 @@ def load_question_bank(path: str) -> QuestionBank:
         raise QuestionBankError(f"question bank {path!r} is not valid UTF-8: {exc}") from exc
 
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
+        raw = json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError) as exc:
         raise QuestionBankError(f"question bank {path!r} is not valid JSON: {exc}") from exc
 
     return validate_question_bank(raw, source_path=path)
